@@ -83,3 +83,5 @@ on resource restart - only tree growth needs to survive restarts.
 ## Debug
 Set `Config.Debug = true` to enable `/spawnlog`, `/clearlog`, and
 `/spawnwagon` test commands, plus verbose server/client console logging.
+
+Credit Mack
