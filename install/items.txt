@@ -1,0 +1,2 @@
+-- Trees and Lumber 
+   ['tree_seeds']     = { name = 'tree_seeds', label = 'Tree Seeds', weight = 100, type = 'item', image = 'tree_seeds.png', unique = false, useable = true, shouldClose = true, description = 'Tree Seeds — useful item to have around.', category = 'general' },
