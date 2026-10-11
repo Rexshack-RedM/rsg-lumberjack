@@ -402,18 +402,15 @@ CreateThread(function()
 
         if #wildTrees > 0 then
             pcall(function()
-                exports['rsg-target']:AddTargetModel(wildTrees, {
-                    options = {
+                exports.ox_target:addModel(wildTrees, {
                         {
-                            type = 'client',
-                            action = function(entity)
+                            onSelect = function(data)
                                 RunChopFlow('wildtree', 0)
                             end,
                             icon = 'fas fa-tree',
                             label = 'Chop Tree',
+                            distance = Config.Chopping.InteractDistance,
                         },
-                    },
-                    distance = Config.Chopping.InteractDistance
                 })
             end)
         end
@@ -440,23 +437,20 @@ local function SpawnGroundLogEntity(logData)
 
     pcall(function()
         if DoesEntityExist(obj) then
-            exports['rsg-target']:AddTargetEntity(obj, {
-                options = {
+            exports.ox_target:addLocalEntity(obj, {
                     {
-                        type = 'client',
-                        action = function() RunChopFlow('groundlog', logData.id) end,
+                        onSelect = function() RunChopFlow('groundlog', logData.id) end,
                         icon = 'fas fa-axe',
                         label = 'Process into Wood',
+                        distance = 2.0,
                     },
                     {
-                        type = 'client',
-                        action = function() PickupLog(logData.id) end,
+                        onSelect = function() PickupLog(logData.id) end,
                         icon = 'fas fa-hand-paper',
                         label = 'Pick Up Log',
+                        distance = 2.0,
                     }
-                },
-                distance = 2.0
-            })
+                })
         end
     end)
 
@@ -466,7 +460,7 @@ end
 local function RemoveGroundLogEntity(logId)
     local entity = State.groundLogs[logId]
     if entity and DoesEntityExist(entity) then
-        exports['rsg-target']:RemoveTargetEntity(entity)
+        exports.ox_target:removeLocalEntity(entity)
         DeleteEntity(entity)
     end
     State.groundLogs[logId] = nil
@@ -475,7 +469,7 @@ end
 RegisterNetEvent('rsg-lumberjack:client:syncGroundLogs', function(logs)
     for _, entity in pairs(State.groundLogs) do
         if DoesEntityExist(entity) then
-            exports['rsg-target']:RemoveTargetEntity(entity)
+            exports.ox_target:removeLocalEntity(entity)
             DeleteEntity(entity)
         end
     end
@@ -514,17 +508,14 @@ local function SpawnWoodEntity(woodData)
 
     pcall(function()
         if DoesEntityExist(obj) then
-            exports['rsg-target']:AddTargetEntity(obj, {
-                options = {
+            exports.ox_target:addLocalEntity(obj, {
                     {
-                        type = 'client',
-                        action = function() TriggerServerEvent('rsg-lumberjack:server:pickupWood', woodData.id) end,
+                        onSelect = function() TriggerServerEvent('rsg-lumberjack:server:pickupWood', woodData.id) end,
                         icon = 'fas fa-hand-paper',
                         label = 'Pick Up Wood',
+                        distance = 2.0,
                     }
-                },
-                distance = 2.0
-            })
+                })
         end
     end)
 
@@ -534,7 +525,7 @@ end
 local function RemoveWoodEntity(woodId)
     local entity = State.woodPieces[woodId]
     if entity and DoesEntityExist(entity) then
-        exports['rsg-target']:RemoveTargetEntity(entity)
+        exports.ox_target:removeLocalEntity(entity)
         DeleteEntity(entity)
     end
     State.woodPieces[woodId] = nil
@@ -543,7 +534,7 @@ end
 RegisterNetEvent('rsg-lumberjack:client:syncWoodPieces', function(woods)
     for _, entity in pairs(State.woodPieces) do
         if DoesEntityExist(entity) then
-            exports['rsg-target']:RemoveTargetEntity(entity)
+            exports.ox_target:removeLocalEntity(entity)
             DeleteEntity(entity)
         end
     end
@@ -596,11 +587,9 @@ local function SpawnWagonLogProp(wagon, wagonNetId, posIndex)
 
     pcall(function()
         if DoesEntityExist(logProp) then
-            exports['rsg-target']:AddTargetEntity(logProp, {
-                options = {
+            exports.ox_target:addLocalEntity(logProp, {
                     {
-                        type = 'client',
-                        action = function()
+                        onSelect = function()
                             if State.carryingLog then
                                 NotifyError('already_carrying')
                                 return
@@ -609,10 +598,9 @@ local function SpawnWagonLogProp(wagon, wagonNetId, posIndex)
                         end,
                         icon = 'fas fa-hand-paper',
                         label = 'Remove Log',
+                        distance = 3.0,
                     }
-                },
-                distance = 3.0
-            })
+                })
         end
     end)
 end
@@ -625,7 +613,7 @@ local function RemoveWagonLogProp(wagonNetId, posIndex)
         if logEntities[i].posIndex == posIndex then
             local logData = table.remove(logEntities, i)
             if logData.prop and DoesEntityExist(logData.prop) then
-                exports['rsg-target']:RemoveTargetEntity(logData.prop)
+                exports.ox_target:removeLocalEntity(logData.prop)
                 DeleteEntity(logData.prop)
             end
             break
@@ -638,7 +626,7 @@ local function ClearWagonLogProps(wagonNetId)
     if logEntities then
         for _, logData in ipairs(logEntities) do
             if logData.prop and DoesEntityExist(logData.prop) then
-                exports['rsg-target']:RemoveTargetEntity(logData.prop)
+                exports.ox_target:removeLocalEntity(logData.prop)
                 DeleteEntity(logData.prop)
             end
         end
@@ -648,26 +636,24 @@ end
 
 CreateThread(function()
     pcall(function()
-        exports['rsg-target']:AddTargetModel({ Config.Wagon.Model }, {
-            options = {
+        exports.ox_target:addModel({ Config.Wagon.Model }, {
                 {
-                    type = 'client',
-                    action = function(entity)
+                    onSelect = function(data)
                         if not State.carryingLog then
                             NotifyError('not_carrying')
                             return
                         end
-                        local wagonNetId = NetworkGetNetworkIdFromEntity(entity)
+                        local wagonNetId = NetworkGetNetworkIdFromEntity(data.entity)
                         TriggerServerEvent('rsg-lumberjack:server:addLogToWagon', wagonNetId)
                     end,
                     icon = 'fas fa-truck-loading',
                     label = 'Load Log onto Wagon',
-                    canInteract = function() return State.carryingLog end
+                    distance = 3.0,
+                    canInteract = function() return State.carryingLog == true end
                 },
                 {
-                    type = 'client',
-                    action = function(entity)
-                        local wagonNetId = NetworkGetNetworkIdFromEntity(entity)
+                    onSelect = function(data)
+                        local wagonNetId = NetworkGetNetworkIdFromEntity(data.entity)
                         RSGCore.Functions.TriggerCallback('rsg-lumberjack:server:getWagonLogs', function(result)
                             Notify('wagon_check', { result.logCount or 0, Config.Wagon.MaxLogsOnWagon })
                         end, wagonNetId)
@@ -675,10 +661,9 @@ CreateThread(function()
                     end,
                     icon = 'fas fa-clipboard-check',
                     label = 'Check Wagon',
+                    distance = 3.0,
                 }
-            },
-            distance = 3.0
-        })
+                })
     end)
 end)
 
@@ -862,7 +847,7 @@ end)
 function DespawnPlantedTreeEntity(id)
     local ent = State.treeEntities[id]
     if ent and DoesEntityExist(ent) then
-        exports['rsg-target']:RemoveTargetEntity(ent)
+        exports.ox_target:removeLocalEntity(ent)
         DeleteEntity(ent)
     end
     State.treeEntities[id] = nil
@@ -912,15 +897,14 @@ function RegisterPlantedTreeTarget(id, ent, tree)
 
     if tree.stage == 4 and tree.state == 'ready' then
         options[#options + 1] = {
-            type = 'client',
-            action = function() RunChopFlow('plantedtree', id) end,
+            onSelect = function() RunChopFlow('plantedtree', id) end,
             icon = 'fas fa-axe',
             label = 'Chop Tree',
+            distance = Config.Chopping.InteractDistance,
         }
     elseif (tree.watered or 0) == 0 then
         options[#options + 1] = {
-            type = 'client',
-            action = function()
+            onSelect = function()
                 if Config.Planting.RequireWater then
                     local hasWater = RSGCore.Functions.HasItem(Config.Planting.WaterItem, 1)
                     if not hasWater then
@@ -932,13 +916,15 @@ function RegisterPlantedTreeTarget(id, ent, tree)
             end,
             icon = 'fas fa-droplet',
             label = 'Water Tree',
+            distance = Config.Chopping.InteractDistance,
         }
     end
 
     if ent and DoesEntityExist(ent) and #options > 0 then
         pcall(function()
             if DoesEntityExist(ent) then
-                exports['rsg-target']:AddTargetEntity(ent, { options = options, distance = Config.Chopping.InteractDistance })
+                exports.ox_target:removeLocalEntity(ent)
+                exports.ox_target:addLocalEntity(ent, options)
             end
         end)
     end
@@ -1075,21 +1061,21 @@ AddEventHandler('onResourceStop', function(resource)
 
     for _, entity in pairs(State.groundLogs) do
         if DoesEntityExist(entity) then
-            exports['rsg-target']:RemoveTargetEntity(entity)
+            exports.ox_target:removeLocalEntity(entity)
             DeleteEntity(entity)
         end
     end
 
     for _, entity in pairs(State.woodPieces) do
         if DoesEntityExist(entity) then
-            exports['rsg-target']:RemoveTargetEntity(entity)
+            exports.ox_target:removeLocalEntity(entity)
             DeleteEntity(entity)
         end
     end
 
     for _, ent in pairs(State.treeEntities) do
         if DoesEntityExist(ent) then
-            exports['rsg-target']:RemoveTargetEntity(ent)
+            exports.ox_target:removeLocalEntity(ent)
             DeleteEntity(ent)
         end
     end
@@ -1097,7 +1083,7 @@ AddEventHandler('onResourceStop', function(resource)
     for _, logEntities in pairs(State.wagonLogEntities) do
         for _, logData in ipairs(logEntities) do
             if logData.prop and DoesEntityExist(logData.prop) then
-                exports['rsg-target']:RemoveTargetEntity(logData.prop)
+                exports.ox_target:removeLocalEntity(logData.prop)
                 DeleteEntity(logData.prop)
             end
         end

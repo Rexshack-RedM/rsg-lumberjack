@@ -8,7 +8,7 @@ growth persists across restarts (see Database section below).
 ## Dependencies
 - `rsg-core`
 - `ox_lib`
-- `rsg-target`
+- `ox_target`
 - `rsg-inventory`
 - `oxmysql` (or `mysql-async`/`ghmattimysql`) - used only to persist planted
   tree growth. Ground logs, wood, and wagon loads remain in-memory only and
