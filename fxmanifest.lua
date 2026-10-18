@@ -4,7 +4,7 @@ game 'rdr3'
 
 name 'rsg-lumberjack'
 description 'Lumberjack gameplay: grow, chop, carry, and sell wagon loads of logs'
-version '3.0.0'
+version '3.1.0'
 
 shared_scripts {
     '@ox_lib/init.lua',
@@ -12,7 +12,7 @@ shared_scripts {
 }
 
 server_scripts {
-    'server/db.lua',
+    '@oxmysql/lib/MySQL.lua',
     'server/main.lua',
     'server/versionchecker.lua'
 }

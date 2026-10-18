@@ -1,8 +1,6 @@
 -- rsg-lumberjack - Server
--- Ground logs/wood/wagon/carry state is in-memory only and resets on resource
--- restart. Planted trees persist in the database (rsg_lumberjack_trees) so growth
--- progress survives restarts, matching the original script's tree table and
--- growth-scheduling logic.
+-- Ground logs, wood piles, wagon loads and carry state are in-memory only and
+-- reset on resource restart. Planted trees persist in `rsg_lumberjack_trees`.
 
 local RSGCore = exports['rsg-core']:GetCoreObject()
 lib.locale()
@@ -10,43 +8,36 @@ lib.locale()
 -- ============================================================================
 -- STATE
 -- ============================================================================
-local PlantedTrees = {}     -- [id] = { id, identifier, x, y, z, heading, model, stage, state, watered, fertilized, next_stage_at, owner_citizenid }
-local GroundLogs = {}       -- [id] = { id, x, y, z, owner }
-local WoodPieces = {}       -- [id] = { id, x, y, z, owner }
-local WagonLoads = {}       -- [wagonNetId] = { logCount = n, positions = { posIndex, ... } }
+local PlantedTrees = {}     -- [id] = { id, owner_citizenid, x, y, z, heading, stage, state, watered, next_ts }
+local GroundLogs = {}       -- [id] = { id, x, y, z, createdAt }
+local WoodPieces = {}       -- [id] = { id, x, y, z, createdAt }
+local WagonLoads = {}       -- [wagonNetId] = log count (authoritative)
 local CarryingPlayers = {}  -- [src] = true
 local PendingActions = {}   -- [src] = { kind, targetId, startedAt, duration }
 local LastChopAt = {}       -- [src] = GetGameTimer()
+local PlantingPlayers = {}  -- [src] = true while a DB insert is in flight
+local LastSyncAt = {}       -- [src] = GetGameTimer() of last full sync
 
-local nextLogId = 1
-local nextWoodId = 1
+local nextLogId, nextWoodId = 1, 1
 
 -- ============================================================================
 -- HELPERS
 -- ============================================================================
 local function DebugPrint(...)
-    if Config.Debug then
-        print('[rsg-lumberjack]', ...)
-    end
+    if Config.Debug then print('[rsg-lumberjack]', ...) end
 end
 
-local function Notify(src, descKey, descArgs, type)
+local function Notify(src, key, args, ntype)
     TriggerClientEvent('ox_lib:notify', src, {
         title = locale('notify_title'),
-        description = descArgs and locale(descKey, table.unpack(descArgs)) or locale(descKey),
-        type = type or 'inform',
+        description = args and locale(key, table.unpack(args)) or locale(key),
+        type = ntype or 'inform',
         duration = 5000
     })
 end
 
 local function NotifySuccess(src, key, args) Notify(src, key, args, 'success') end
 local function NotifyError(src, key, args) Notify(src, key, args, 'error') end
-
-local function GetDistance(c1, c2)
-    if not c1 or not c2 then return math.huge end
-    local dx, dy, dz = c1.x - c2.x, c1.y - c2.y, c1.z - c2.z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
-end
 
 local function IsFiniteNumber(n)
     return type(n) == 'number' and n == n and n ~= math.huge and n ~= -math.huge
@@ -58,87 +49,87 @@ local function GetPlayerCoords(src)
     return GetEntityCoords(ped)
 end
 
-local function GetPlayerIdentifier(src)
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if Player and Player.PlayerData and Player.PlayerData.citizenid then
-        return Player.PlayerData.citizenid
+local function IsPlayerNear(src, x, y, z, maxDist)
+    local c = GetPlayerCoords(src)
+    if not c then return false end
+    return #(c - vector3(x, y, z)) <= maxDist
+end
+
+local function HasItem(src, item)
+    return exports['rsg-inventory']:HasItem(src, item, 1)
+end
+
+local function RemoveItem(src, item, reason)
+    if exports['rsg-inventory']:RemoveItem(src, item, 1, nil, reason) then
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'remove', 1)
+        return true
     end
-    for _, id in pairs(GetPlayerIdentifiers(src)) do
-        if id:find('license:') == 1 then return id end
-    end
-    return GetPlayerName(src)
+    return false
 end
 
-local function GetAllGroundLogs()
-    local logs = {}
-    for _, data in pairs(GroundLogs) do logs[#logs + 1] = data end
-    return logs
+local function ToList(tbl)
+    local list = {}
+    for _, v in pairs(tbl) do list[#list + 1] = v end
+    return list
 end
 
-local function GetAllWoodPieces()
-    local woods = {}
-    for _, data in pairs(WoodPieces) do woods[#woods + 1] = data end
-    return woods
+local function GetGrowthDuration(stage)
+    return Config.Planting.GrowthDurations[math.max(1, math.min(stage, 3))] or 60
 end
 
-local function ParseDateTime(str)
-    if not str or type(str) ~= 'string' then return nil end
-    local y, M, d, h, m, s = string.match(str, '^(%d+)%-(%d+)%-(%d+) (%d+):(%d+):(%d+)$')
-    if not y then return nil end
-    return os.time({ year = tonumber(y), month = tonumber(M), day = tonumber(d), hour = tonumber(h), min = tonumber(m), sec = tonumber(s) })
-end
-
--- Builds the payload sent to clients for a tree. When a growth timer is
--- actively running, this includes the total stage duration and the seconds
--- remaining *right now* so clients can render a live progress bar without
--- needing to trust/parse the server's wall-clock DATETIME themselves.
+-- Payload sent to clients. Includes seconds remaining *now* so clients can draw
+-- a progress bar without relying on their own wall clock.
 local function BuildTreePayload(t)
-    local payload = {}
-    for k, v in pairs(t) do payload[k] = v end
-
-    if t.state == 'growing' and t.next_stage_at then
-        local ts = ParseDateTime(t.next_stage_at)
-        local duration = Config.Planting.GrowthDurations[math.max(1, math.min(t.stage, 3))] or 60
-        payload.growth_duration = duration
-        payload.growth_remaining = ts and math.max(0, ts - os.time()) or duration
-    else
-        payload.growth_duration = nil
-        payload.growth_remaining = nil
+    local payload = {
+        id = t.id,
+        owner_citizenid = t.owner_citizenid,
+        x = t.x, y = t.y, z = t.z,
+        heading = t.heading,
+        stage = t.stage,
+        state = t.state,
+        watered = t.watered,
+    }
+    if t.state == 'growing' and t.next_ts then
+        payload.growth_duration = GetGrowthDuration(t.stage)
+        payload.growth_remaining = math.max(0, t.next_ts - os.time())
     end
-
     return payload
 end
 
+local function BroadcastTree(t)
+    TriggerClientEvent('rsg-lumberjack:client:updateTreeVisual', -1, BuildTreePayload(t))
+end
+
+-- Carry state: the owning client gets an event; everyone else reads the
+-- replicated player state bag so late joiners / players streaming in see it.
+local function SetCarrying(src, carrying)
+    CarryingPlayers[src] = carrying or nil
+    Player(src).state:set('lumberjackCarrying', carrying or nil, true)
+    TriggerClientEvent(carrying and 'rsg-lumberjack:client:startCarrying' or 'rsg-lumberjack:client:stopCarrying', src)
+end
+
 -- ============================================================================
--- TREE PERSISTENCE (rsg_lumberjack_trees) - same schema/columns as the original
--- lumbercompany_trees table, just renamed since it's no longer company-owned.
+-- TREE PERSISTENCE
 -- ============================================================================
-local function LoadPlantedTreesFromDB()
-    DB.fetchAll('SELECT * FROM rsg_lumberjack_trees WHERE state != ?', { 'chopped' }, function(rows)
-        PlantedTrees = {}
-        for _, r in ipairs(rows or {}) do
-            PlantedTrees[r.id] = {
-                id = r.id,
-                identifier = r.identifier,
-                owner_citizenid = r.owner_citizenid,
-                x = r.x, y = r.y, z = r.z,
-                heading = r.heading,
-                model = r.model,
-                stage = tonumber(r.stage) or 1,
-                state = r.state,
-                watered = tonumber(r.watered) or 0,
-                fertilized = tonumber(r.fertilized) or 0,
-                next_stage_at = r.next_stage_at
-            }
-        end
-        DebugPrint('Loaded', rows and #rows or 0, 'planted trees from database')
-    end)
+-- Starts the growth timer for a tree's current stage once watering (if
+-- required) is satisfied.
+local function MaybeScheduleGrowth(t)
+    if not t or t.stage >= 4 or t.state == 'growing' then return end
+    if Config.Planting.RequireWater and t.watered ~= 1 then return end
+
+    t.next_ts = os.time() + GetGrowthDuration(t.stage)
+    t.state = 'growing'
+    MySQL.update('UPDATE rsg_lumberjack_trees SET state = ?, next_stage_at = FROM_UNIXTIME(?) WHERE id = ?', { 'growing', t.next_ts, t.id })
+    DebugPrint('Tree', t.id, 'growing, next stage at', t.next_ts)
 end
 
 CreateThread(function()
-    Wait(1000)
+    -- Clear stale carry state bags left over from before a resource restart
+    for _, id in ipairs(GetPlayers()) do
+        Player(tonumber(id)).state:set('lumberjackCarrying', nil, true)
+    end
 
-    DB.execute([[
+    MySQL.query.await([[
         CREATE TABLE IF NOT EXISTS `rsg_lumberjack_trees` (
             `id` INT UNSIGNED NOT NULL AUTO_INCREMENT,
             `identifier` VARCHAR(64) NOT NULL,
@@ -155,201 +146,189 @@ CreateThread(function()
             `planted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             `next_stage_at` DATETIME NULL,
             PRIMARY KEY (`id`),
-            INDEX `idx_stage` (`stage`),
-            INDEX `idx_state` (`state`),
             INDEX `idx_owner` (`owner_citizenid`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ]])
 
-    LoadPlantedTreesFromDB()
+    -- UNIX_TIMESTAMP avoids oxmysql's DATETIME -> millisecond conversion, which
+    -- previously broke growth for every tree after a restart.
+    local rows = MySQL.query.await([[
+        SELECT id, owner_citizenid, x, y, z, heading, stage, state, watered,
+               UNIX_TIMESTAMP(next_stage_at) AS next_ts
+        FROM rsg_lumberjack_trees WHERE state != 'chopped'
+    ]]) or {}
+
+    PlantedTrees = {}
+    for _, r in ipairs(rows) do
+        local t = {
+            id = r.id,
+            owner_citizenid = r.owner_citizenid,
+            x = r.x, y = r.y, z = r.z,
+            heading = r.heading or 0.0,
+            stage = tonumber(r.stage) or 1,
+            state = r.state,
+            watered = tonumber(r.watered) or 0,
+            next_ts = tonumber(r.next_ts),
+        }
+        if t.state == 'growing' and not t.next_ts then t.state = 'planted' end
+        PlantedTrees[t.id] = t
+        MaybeScheduleGrowth(t) -- resumes trees that don't need watering
+    end
+    DebugPrint('Loaded', #rows, 'planted trees')
+
+    -- Push to anyone already online (resource restart)
+    TriggerClientEvent('rsg-lumberjack:client:setTrees', -1, (function()
+        local list = {}
+        for _, t in pairs(PlantedTrees) do list[#list + 1] = BuildTreePayload(t) end
+        return list
+    end)())
 end)
 
 -- ============================================================================
 -- USEABLE ITEMS
 -- ============================================================================
-RSGCore.Functions.CreateUseableItem(Config.Planting.SeedItem, function(src, item)
+RSGCore.Functions.CreateUseableItem(Config.Planting.SeedItem, function(src)
     TriggerClientEvent('rsg-lumberjack:client:useSeed', src)
 end)
 
-RSGCore.Functions.CreateUseableItem(Config.Planting.WaterItem, function(src, item)
+RSGCore.Functions.CreateUseableItem(Config.Planting.WaterItem, function(src)
     TriggerClientEvent('rsg-lumberjack:client:useWater', src)
 end)
 
 -- ============================================================================
--- GROUND ITEMS / TREES REQUEST (on player join)
+-- INITIAL SYNC (on player load / resource start)
 -- ============================================================================
-RegisterNetEvent('rsg-lumberjack:server:requestGroundItems', function()
+RegisterNetEvent('rsg-lumberjack:server:requestSync', function()
     local src = source
-    TriggerClientEvent('rsg-lumberjack:client:syncGroundLogs', src, GetAllGroundLogs())
-    TriggerClientEvent('rsg-lumberjack:client:syncWoodPieces', src, GetAllWoodPieces())
+    local now = GetGameTimer()
+    if LastSyncAt[src] and now - LastSyncAt[src] < 5000 then return end -- full sync is heavy; block spam
+    LastSyncAt[src] = now
+    TriggerClientEvent('rsg-lumberjack:client:syncGroundLogs', src, ToList(GroundLogs))
+    TriggerClientEvent('rsg-lumberjack:client:syncWoodPieces', src, ToList(WoodPieces))
+    if CarryingPlayers[src] then TriggerClientEvent('rsg-lumberjack:client:startCarrying', src) end
 
-    local carryingList = {}
-    for serverId, _ in pairs(CarryingPlayers) do
-        carryingList[#carryingList + 1] = serverId
-    end
-    TriggerClientEvent('rsg-lumberjack:client:syncCarryingPlayers', src, carryingList)
-end)
-
-RegisterNetEvent('rsg-lumberjack:server:requestTrees', function()
-    local src = source
-    local list = {}
-    for _, t in pairs(PlantedTrees) do list[#list + 1] = BuildTreePayload(t) end
-    TriggerClientEvent('rsg-lumberjack:client:setTrees', src, list)
+    local trees = {}
+    for _, t in pairs(PlantedTrees) do trees[#trees + 1] = BuildTreePayload(t) end
+    TriggerClientEvent('rsg-lumberjack:client:setTrees', src, trees)
 end)
 
 -- ============================================================================
 -- SECURE CHOP ACTION (wild tree / ground log / planted tree)
--- Golden rule: the client never unilaterally decides "I chopped something".
--- It must request authorization first, then report completion; the server
--- validates axe ownership, cooldown, carry-state, proximity (where a real
--- server-tracked target exists) and elapsed time before granting anything.
+-- The client requests authorisation, runs the progress bar, then reports
+-- completion. The server validates axe, cooldown, carry state, proximity and
+-- elapsed time before granting anything.
 -- ============================================================================
 local VALID_KINDS = { wildtree = true, groundlog = true, plantedtree = true }
 
-local function GetDurationForKind(kind)
-    if kind == 'groundlog' then return Config.Chopping.LogChopDuration end
-    return Config.Chopping.TreeChopDuration
+-- Returns an error locale key or nil when the target is valid for this player
+local function ValidateChopTarget(src, kind, targetId)
+    local maxDist = Config.Chopping.ServerDistance
+    if kind == 'groundlog' then
+        local log = GroundLogs[targetId]
+        if not log then return 'log_not_found' end
+        if not IsPlayerNear(src, log.x, log.y, log.z, maxDist) then return 'not_nearby' end
+    elseif kind == 'plantedtree' then
+        local t = PlantedTrees[targetId]
+        if not t then return 'tree_not_found' end
+        if t.stage < 4 or t.state ~= 'ready' then return 'tree_not_ready' end
+        if not IsPlayerNear(src, t.x, t.y, t.z, maxDist) then return 'not_nearby' end
+    end
+    if kind ~= 'groundlog' and CarryingPlayers[src] then return 'already_carrying' end
+    return nil
 end
 
-RSGCore.Functions.CreateCallback('rsg-lumberjack:server:requestChop', function(source, cb, kind, targetId, clientCoords)
+RSGCore.Functions.CreateCallback('rsg-lumberjack:server:requestChop', function(source, cb, kind, targetId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return cb({ ok = false }) end
+    if not RSGCore.Functions.GetPlayer(src) then return cb({ ok = false }) end
+    if not VALID_KINDS[kind] or type(targetId) ~= 'number' then return cb({ ok = false, reason = 'invalid_request' }) end
 
-    if not VALID_KINDS[kind] then return cb({ ok = false, reason = 'invalid_request' }) end
-
-    -- Cooldown
-    local last = LastChopAt[src] or 0
-    if (GetGameTimer() - last) < Config.Chopping.ChopCooldownMs then
-        local remaining = math.ceil((Config.Chopping.ChopCooldownMs - (GetGameTimer() - last)) / 1000)
-        return cb({ ok = false, reason = 'cooldown_wait', args = { remaining } })
+    local now = GetGameTimer()
+    local elapsedSinceChop = now - (LastChopAt[src] or -math.huge)
+    if elapsedSinceChop < Config.Chopping.ChopCooldownMs then
+        return cb({ ok = false, reason = 'cooldown_wait', args = { math.ceil((Config.Chopping.ChopCooldownMs - elapsedSinceChop) / 1000) } })
     end
 
-    -- Already mid-action
     local pending = PendingActions[src]
-    if pending and (GetGameTimer() - pending.startedAt) < (pending.duration + Config.Chopping.ActionTimeoutMs) then
+    if pending and (now - pending.startedAt) < (pending.duration + Config.Chopping.ActionTimeoutMs) then
         return cb({ ok = false, reason = 'busy' })
     end
 
-    -- Wild/planted tree chops grant a carried log - can't already be carrying one
-    if kind ~= 'groundlog' and CarryingPlayers[src] then
-        return cb({ ok = false, reason = 'already_carrying' })
+    if Config.Chopping.RequireAxe and not HasItem(src, Config.Chopping.AxeItem) then
+        return cb({ ok = false, reason = 'need_axe' })
     end
 
-    -- Axe check
-    if Config.Chopping.RequireAxe then
-        local axeItem = Player.Functions.GetItemByName(Config.Chopping.AxeItem)
-        if not axeItem or (axeItem.amount or axeItem.count or 0) <= 0 then
-            return cb({ ok = false, reason = 'need_axe' })
-        end
-    end
+    local err = ValidateChopTarget(src, kind, targetId)
+    if err then return cb({ ok = false, reason = err }) end
 
-    if kind == 'groundlog' then
-        local logData = GroundLogs[targetId]
-        if not logData then return cb({ ok = false, reason = 'log_not_found' }) end
-        local pCoords = GetPlayerCoords(src)
-        if GetDistance(pCoords, vector3(logData.x, logData.y, logData.z)) > (Config.Chopping.InteractDistance + 2.0) then
-            return cb({ ok = false, reason = 'not_nearby' })
-        end
-    elseif kind == 'plantedtree' then
-        local t = PlantedTrees[targetId]
-        if not t then return cb({ ok = false, reason = 'tree_not_found' }) end
-        if t.stage < 4 or t.state ~= 'ready' then return cb({ ok = false, reason = 'tree_not_ready' }) end
-        local pCoords = GetPlayerCoords(src)
-        if GetDistance(pCoords, vector3(t.x, t.y, t.z)) > (Config.Chopping.InteractDistance + 2.0) then
-            return cb({ ok = false, reason = 'not_nearby' })
-        end
-    else -- wildtree: no server-tracked entity exists for static world props, so we can only
-        -- sanity-check the coordinates the client reports it is standing at. The
-        -- cooldown/axe/token/elapsed-time checks below are what actually prevent farming.
-        if not (clientCoords and IsFiniteNumber(clientCoords.x) and IsFiniteNumber(clientCoords.y) and IsFiniteNumber(clientCoords.z)) then
-            return cb({ ok = false, reason = 'invalid_request' })
-        end
-    end
-
-    local duration = GetDurationForKind(kind)
-    PendingActions[src] = { kind = kind, targetId = targetId, startedAt = GetGameTimer(), duration = duration }
+    local duration = kind == 'groundlog' and Config.Chopping.LogChopDuration or Config.Chopping.TreeChopDuration
+    PendingActions[src] = { kind = kind, targetId = targetId, startedAt = now, duration = duration }
     cb({ ok = true, duration = duration })
+end)
+
+RegisterNetEvent('rsg-lumberjack:server:cancelChop', function()
+    PendingActions[source] = nil
 end)
 
 RegisterNetEvent('rsg-lumberjack:server:completeChop', function(kind, targetId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
 
     local pending = PendingActions[src]
-    PendingActions[src] = nil -- single use, always clear regardless of outcome
+    PendingActions[src] = nil -- single use
 
     if not pending or pending.kind ~= kind or pending.targetId ~= targetId then
-        NotifyError(src, 'invalid_request')
-        return
+        return NotifyError(src, 'invalid_request')
     end
 
     local elapsed = GetGameTimer() - pending.startedAt
     if elapsed < (pending.duration - 1500) then
-        -- finished suspiciously fast for the configured duration
-        NotifyError(src, 'invalid_request')
-        return
+        return NotifyError(src, 'invalid_request')
     end
     if elapsed > (pending.duration + Config.Chopping.ActionTimeoutMs) then
-        NotifyError(src, 'action_expired')
-        return
+        return NotifyError(src, 'action_expired')
     end
+
+    -- Re-validate: the target may have been taken, or the player walked away /
+    -- picked up another log while the progress bar was running.
+    local err = ValidateChopTarget(src, kind, targetId)
+    if err then return NotifyError(src, err) end
 
     LastChopAt[src] = GetGameTimer()
 
-    -- Server rolls the axe-break chance, never the client
-    local axeBroke = false
-    if Config.Chopping.RequireAxe and Config.Chopping.AxeBreakChance > 0 and math.random(100) <= Config.Chopping.AxeBreakChance then
-        local axeItem = Player.Functions.GetItemByName(Config.Chopping.AxeItem)
-        if axeItem and (axeItem.amount or axeItem.count or 0) > 0 then
-            Player.Functions.RemoveItem(Config.Chopping.AxeItem, 1)
-            TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[Config.Chopping.AxeItem], 'remove', 1)
-            axeBroke = true
-        end
-    end
-
     if kind == 'groundlog' then
-        local logData = GroundLogs[targetId]
-        if not logData then
-            NotifyError(src, 'log_not_found')
-            return
-        end
-
+        local log = GroundLogs[targetId]
         GroundLogs[targetId] = nil
         TriggerClientEvent('rsg-lumberjack:client:removeGroundLog', -1, targetId)
 
-        local woodCount = Config.Items.WoodAmountFromLog or 4
-        for _ = 1, woodCount do
-            local woodId = nextWoodId
+        local radius = Config.Items.SpawnRadius
+        local now = os.time()
+        for _ = 1, Config.Items.WoodAmountFromLog do
+            local wood = {
+                id = nextWoodId,
+                x = log.x + (math.random() - 0.5) * radius,
+                y = log.y + (math.random() - 0.5) * radius,
+                z = log.z,
+                createdAt = now,
+            }
             nextWoodId = nextWoodId + 1
-            local offsetX = (math.random() - 0.5) * (Config.Items.SpawnRadius or 3.0)
-            local offsetY = (math.random() - 0.5) * (Config.Items.SpawnRadius or 3.0)
-            local woodData = { id = woodId, x = logData.x + offsetX, y = logData.y + offsetY, z = logData.z, owner = src }
-            WoodPieces[woodId] = woodData
-            TriggerClientEvent('rsg-lumberjack:client:addWoodPiece', -1, woodData)
+            WoodPieces[wood.id] = wood
+            TriggerClientEvent('rsg-lumberjack:client:addWoodPiece', -1, wood)
         end
-
         NotifySuccess(src, 'chop_success_log')
     else
-        -- wildtree / plantedtree: grant a carried log
         if kind == 'plantedtree' then
-            local t = PlantedTrees[targetId]
-            if not t or t.stage < 4 or t.state ~= 'ready' then
-                NotifyError(src, 'tree_not_ready')
-                return
-            end
             PlantedTrees[targetId] = nil
-            DB.execute('DELETE FROM rsg_lumberjack_trees WHERE id = ?', { targetId })
+            MySQL.update('DELETE FROM rsg_lumberjack_trees WHERE id = ?', { targetId })
             TriggerClientEvent('rsg-lumberjack:client:removeTree', -1, targetId)
         end
-
-        CarryingPlayers[src] = true
-        TriggerClientEvent('rsg-lumberjack:client:playerStartedCarrying', -1, src)
+        SetCarrying(src, true)
         NotifySuccess(src, 'chop_success_tree')
     end
 
-    if axeBroke then
+    -- Axe break is rolled server-side
+    if Config.Chopping.RequireAxe and Config.Chopping.AxeBreakChance > 0
+        and math.random(100) <= Config.Chopping.AxeBreakChance
+        and RemoveItem(src, Config.Chopping.AxeItem, 'lumberjack-axe-broke') then
         NotifyError(src, 'axe_broken')
     end
 
@@ -357,251 +336,172 @@ RegisterNetEvent('rsg-lumberjack:server:completeChop', function(kind, targetId)
 end)
 
 -- ============================================================================
--- CARRYING / GROUND LOG SYSTEM
+-- CARRYING / GROUND LOGS / WOOD
 -- ============================================================================
-RegisterNetEvent('rsg-lumberjack:server:dropLog', function(x, y, z)
+RegisterNetEvent('rsg-lumberjack:server:dropLog', function()
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
+    if not CarryingPlayers[src] then return NotifyError(src, 'not_carrying') end
 
-    if not CarryingPlayers[src] then
-        NotifyError(src, 'not_carrying')
-        return
-    end
-
-    if not (IsFiniteNumber(x) and IsFiniteNumber(y) and IsFiniteNumber(z)) then return end
-
-    CarryingPlayers[src] = nil
-    TriggerClientEvent('rsg-lumberjack:client:playerStoppedCarrying', -1, src)
-
-    local logId = nextLogId
+    -- Drop position is derived from the server-side ped, never the client
+    local ped = GetPlayerPed(src)
+    local coords = GetEntityCoords(ped)
+    local heading = math.rad(GetEntityHeading(ped))
+    local log = {
+        id = nextLogId,
+        x = coords.x - math.sin(heading) * 1.0,
+        y = coords.y + math.cos(heading) * 1.0,
+        z = coords.z - 1.0,
+        createdAt = os.time(),
+    }
     nextLogId = nextLogId + 1
-    local logData = { id = logId, x = x, y = y, z = z, owner = src }
-    GroundLogs[logId] = logData
 
-    TriggerClientEvent('rsg-lumberjack:client:addGroundLog', -1, logData)
+    SetCarrying(src, false)
+    GroundLogs[log.id] = log
+    TriggerClientEvent('rsg-lumberjack:client:addGroundLog', -1, log)
     NotifySuccess(src, 'log_dropped')
-    DebugPrint('Player', src, 'dropped log', logId)
 end)
 
 RegisterNetEvent('rsg-lumberjack:server:pickupLog', function(logId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
+    if CarryingPlayers[src] then return NotifyError(src, 'already_carrying') end
 
-    if CarryingPlayers[src] then
-        NotifyError(src, 'already_carrying')
-        return
-    end
-
-    local logData = GroundLogs[logId]
-    if not logData then
-        NotifyError(src, 'log_not_found')
-        return
-    end
-
-    local pCoords = GetPlayerCoords(src)
-    if GetDistance(pCoords, vector3(logData.x, logData.y, logData.z)) > (Config.Chopping.InteractDistance + 2.0) then
-        NotifyError(src, 'not_nearby')
-        return
-    end
+    local log = GroundLogs[logId]
+    if not log then return NotifyError(src, 'log_not_found') end
+    if not IsPlayerNear(src, log.x, log.y, log.z, Config.Chopping.ServerDistance) then return NotifyError(src, 'not_nearby') end
 
     GroundLogs[logId] = nil
     TriggerClientEvent('rsg-lumberjack:client:removeGroundLog', -1, logId)
-
-    CarryingPlayers[src] = true
-    TriggerClientEvent('rsg-lumberjack:client:playerStartedCarrying', -1, src)
+    SetCarrying(src, true)
     NotifySuccess(src, 'log_picked_up')
-
-    DebugPrint('Player', src, 'picked up log', logId)
 end)
 
 RegisterNetEvent('rsg-lumberjack:server:pickupWood', function(woodId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
 
-    local woodData = WoodPieces[woodId]
-    if not woodData then
-        NotifyError(src, 'wood_not_found')
-        return
-    end
+    local wood = WoodPieces[woodId]
+    if not wood then return NotifyError(src, 'wood_not_found') end
+    if not IsPlayerNear(src, wood.x, wood.y, wood.z, Config.Chopping.ServerDistance) then return NotifyError(src, 'not_nearby') end
 
-    local pCoords = GetPlayerCoords(src)
-    if GetDistance(pCoords, vector3(woodData.x, woodData.y, woodData.z)) > (Config.Chopping.InteractDistance + 2.0) then
-        NotifyError(src, 'not_nearby')
-        return
-    end
+    local item = Config.Items.Wood
+    if not exports['rsg-inventory']:CanAddItem(src, item, 1) then return NotifyError(src, 'inventory_full') end
 
-    WoodPieces[woodId] = nil
+    WoodPieces[woodId] = nil -- claim before adding so a double event can't dupe
     TriggerClientEvent('rsg-lumberjack:client:removeWoodPiece', -1, woodId)
 
-    Player.Functions.AddItem(Config.Items.Wood, 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[Config.Items.Wood], 'add', 1)
-    NotifySuccess(src, 'wood_picked_up')
-
-    DebugPrint('Player', src, 'picked up wood', woodId)
+    exports['rsg-inventory']:AddItem(src, item, 1, nil, nil, 'lumberjack-wood-pickup')
+    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'add', 1)
 end)
 
 -- ============================================================================
--- TREE PLANTING / GROWING SYSTEM (plant anywhere; persisted to the database)
+-- TREE PLANTING / GROWING
 -- ============================================================================
 RegisterNetEvent('rsg-lumberjack:server:plantTree', function(pos, heading)
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not Player or PlantingPlayers[src] then return end
 
-    if not (pos and IsFiniteNumber(pos.x) and IsFiniteNumber(pos.y) and IsFiniteNumber(pos.z)) then
-        NotifyError(src, 'invalid_location')
-        return
+    if type(pos) ~= 'table' or not (IsFiniteNumber(pos.x) and IsFiniteNumber(pos.y) and IsFiniteNumber(pos.z)) then
+        return NotifyError(src, 'invalid_location')
+    end
+    -- The client picks the exact ground point, but it must be right in front of the player
+    if not IsPlayerNear(src, pos.x, pos.y, pos.z, Config.Chopping.RaycastDistance + 2.5) then
+        return NotifyError(src, 'invalid_location')
     end
     heading = tonumber(heading) or 0.0
 
-    local identifier = GetPlayerIdentifier(src)
     local citizenid = Player.PlayerData.citizenid
-
+    local plantPos = vector3(pos.x, pos.y, pos.z)
     local ownedCount = 0
     for _, t in pairs(PlantedTrees) do
-        if t.owner_citizenid == citizenid and t.state ~= 'chopped' then
-            ownedCount = ownedCount + 1
-        end
-        local dist = GetDistance(vector3(t.x, t.y, t.z), vector3(pos.x, pos.y, pos.z))
-        if dist < Config.Planting.MinPlantDistance then
-            NotifyError(src, 'too_close_to_tree')
-            return
+        if t.owner_citizenid == citizenid then ownedCount = ownedCount + 1 end
+        if #(vector3(t.x, t.y, t.z) - plantPos) < Config.Planting.MinPlantDistance then
+            return NotifyError(src, 'too_close_to_tree')
         end
     end
-
     if ownedCount >= Config.Planting.MaxTreesPerPlayer then
-        NotifyError(src, 'max_trees_reached', { Config.Planting.MaxTreesPerPlayer })
-        return
+        return NotifyError(src, 'max_trees_reached', { Config.Planting.MaxTreesPerPlayer })
     end
 
-    local seedItem = Player.Functions.GetItemByName(Config.Planting.SeedItem)
-    if not seedItem or (seedItem.amount or seedItem.count or 0) <= 0 then
-        NotifyError(src, 'need_seed')
-        return
+    if not RemoveItem(src, Config.Planting.SeedItem, 'lumberjack-plant-tree') then
+        return NotifyError(src, 'need_seed')
     end
-    Player.Functions.RemoveItem(Config.Planting.SeedItem, 1)
-    TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[Config.Planting.SeedItem], 'remove', 1)
 
-    local model = Config.Planting.StageModels[1]
-
-    DB.insert_id(
-        'INSERT INTO rsg_lumberjack_trees (identifier, owner_citizenid, x, y, z, heading, model, stage, state, watered, fertilized) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        { identifier, citizenid, pos.x, pos.y, pos.z, heading, model, 1, 'planted', 0, 0 },
-        function(newId)
-            local id = tonumber(newId) or 0
-            local tree = {
-                id = id,
-                identifier = identifier,
-                owner_citizenid = citizenid,
-                x = pos.x, y = pos.y, z = pos.z,
-                heading = heading,
-                model = model,
-                stage = 1,
-                state = 'planted',
-                watered = 0,
-                fertilized = 0,
-                next_stage_at = nil
-            }
-            PlantedTrees[id] = tree
-            TriggerClientEvent('rsg-lumberjack:client:updateTreeVisual', -1, BuildTreePayload(tree))
-            NotifySuccess(src, 'tree_planted')
-            DebugPrint('Player', src, 'planted tree', id)
-        end
+    PlantingPlayers[src] = true
+    local license = RSGCore.Functions.GetIdentifier(src, 'license') or citizenid
+    local id = MySQL.insert.await(
+        'INSERT INTO rsg_lumberjack_trees (identifier, owner_citizenid, x, y, z, heading, model, stage, state) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
+        { license, citizenid, pos.x, pos.y, pos.z, heading, Config.Planting.StageModels[1], 'planted' }
     )
+    PlantingPlayers[src] = nil
+
+    if not id then
+        exports['rsg-inventory']:AddItem(src, Config.Planting.SeedItem, 1, nil, nil, 'lumberjack-plant-refund')
+        return NotifyError(src, 'error_generic')
+    end
+
+    local tree = {
+        id = id,
+        owner_citizenid = citizenid,
+        x = pos.x, y = pos.y, z = pos.z,
+        heading = heading,
+        stage = 1,
+        state = 'planted',
+        watered = 0,
+    }
+    PlantedTrees[id] = tree
+    MaybeScheduleGrowth(tree)
+    BroadcastTree(tree)
+    NotifySuccess(src, Config.Planting.RequireWater and 'tree_planted' or 'tree_planted_nowater')
 end)
-
--- Mirrors the original script's MaybeScheduleGrowth: only starts the growth
--- timer once the watering requirement is satisfied, then persists it.
-function MaybeScheduleGrowth(id)
-    local t = PlantedTrees[id]
-    if not t or t.stage >= 4 then return end
-
-    local canGrow = Config.Debug or (not Config.Planting.RequireWater or t.watered == 1)
-    if not canGrow then return end
-
-    local duration = Config.Planting.GrowthDurations[math.max(1, math.min(t.stage, 3))] or 60
-    local nextAt = os.date('%Y-%m-%d %H:%M:%S', os.time() + duration)
-    t.next_stage_at = nextAt
-    t.state = 'growing'
-    DB.execute('UPDATE rsg_lumberjack_trees SET state = ?, next_stage_at = ? WHERE id = ?', { 'growing', nextAt, id })
-    TriggerClientEvent('rsg-lumberjack:client:updateTreeVisual', -1, BuildTreePayload(t))
-    DebugPrint('Tree', id, 'scheduled for growth at', nextAt)
-end
 
 RegisterNetEvent('rsg-lumberjack:server:waterTree', function(id)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
 
     local t = PlantedTrees[id]
-    if not t then
-        NotifyError(src, 'tree_not_found')
-        return
-    end
-    if t.stage >= 4 then
-        NotifyError(src, 'tree_already_grown')
-        return
-    end
+    if not t then return NotifyError(src, 'tree_not_found') end
+    if t.stage >= 4 then return NotifyError(src, 'tree_already_grown') end
+    if t.watered == 1 or t.state == 'growing' then return NotifyError(src, 'tree_already_watered') end
+    if not IsPlayerNear(src, t.x, t.y, t.z, Config.Chopping.ServerDistance) then return NotifyError(src, 'not_nearby') end
 
-    local pCoords = GetPlayerCoords(src)
-    if GetDistance(pCoords, vector3(t.x, t.y, t.z)) > (Config.Chopping.InteractDistance + 2.0) then
-        NotifyError(src, 'not_nearby')
-        return
-    end
-
-    if Config.Planting.RequireWater then
-        local waterItem = Player.Functions.GetItemByName(Config.Planting.WaterItem)
-        if not waterItem or (waterItem.amount or waterItem.count or 0) <= 0 then
-            NotifyError(src, 'need_water')
-            return
-        end
-        Player.Functions.RemoveItem(Config.Planting.WaterItem, 1)
-        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[Config.Planting.WaterItem], 'remove', 1)
+    if Config.Planting.RequireWater and not RemoveItem(src, Config.Planting.WaterItem, 'lumberjack-water-tree') then
+        return NotifyError(src, 'need_water')
     end
 
     t.watered = 1
-    DB.execute('UPDATE rsg_lumberjack_trees SET watered = 1 WHERE id = ?', { id })
-    MaybeScheduleGrowth(id) -- broadcasts the updated tree (with a fresh growth timer) itself
+    MySQL.update('UPDATE rsg_lumberjack_trees SET watered = 1 WHERE id = ?', { id })
+    MaybeScheduleGrowth(t)
+    BroadcastTree(t)
     NotifySuccess(src, 'tree_watered')
 end)
 
+-- Growth tick
 CreateThread(function()
     while true do
-        Wait(60 * 1000)
-        local changed = {}
+        Wait(Config.Planting.GrowthTickSeconds * 1000)
         local now = os.time()
 
         for id, t in pairs(PlantedTrees) do
-            if t.state ~= 'chopped' and t.stage < 4 and t.next_stage_at then
-                local ts = ParseDateTime(t.next_stage_at)
-                if ts and now >= ts then
-                    t.stage = t.stage + 1
-                    if t.stage >= 4 then
-                        t.stage = 4
-                        t.state = 'ready'
-                        t.next_stage_at = nil
-                    else
-                        t.state = 'growing'
-                        t.next_stage_at = nil
-                    end
-                    t.watered = 0
-                    t.fertilized = 0
-                    DB.execute('UPDATE rsg_lumberjack_trees SET stage = ?, state = ?, next_stage_at = NULL, watered = 0, fertilized = 0 WHERE id = ?',
-                        { t.stage, t.state, id })
-                    changed[#changed + 1] = t
-                end
-            end
-        end
+            if t.state == 'growing' and t.next_ts and now >= t.next_ts then
+                t.stage = math.min(t.stage + 1, 4)
+                t.state = t.stage >= 4 and 'ready' or 'planted'
+                t.next_ts = nil
+                t.watered = 0
+                MySQL.update('UPDATE rsg_lumberjack_trees SET stage = ?, state = ?, next_stage_at = NULL, watered = 0 WHERE id = ?', { t.stage, t.state, id })
 
-        for _, t in ipairs(changed) do
-            TriggerClientEvent('rsg-lumberjack:client:updateTreeVisual', -1, BuildTreePayload(t))
-            if t.stage == 4 and t.state == 'ready' then
-                local ownerPlayer = RSGCore.Functions.GetPlayerByCitizenId(t.owner_citizenid)
-                if ownerPlayer then
-                    NotifySuccess(ownerPlayer.PlayerData.source, 'tree_ready')
+                MaybeScheduleGrowth(t) -- continues automatically when watering isn't required
+                BroadcastTree(t)
+
+                local owner = RSGCore.Functions.GetPlayerByCitizenId(t.owner_citizenid)
+                if owner then
+                    if t.state == 'ready' then
+                        NotifySuccess(owner.PlayerData.source, 'tree_ready')
+                    elseif Config.Planting.RequireWater then
+                        Notify(owner.PlayerData.source, 'tree_needs_water')
+                    end
                 end
             end
         end
@@ -609,201 +509,140 @@ CreateThread(function()
 end)
 
 -- ============================================================================
--- WAGON SYSTEM (load / unload / sell at multiple locations)
+-- WAGON SYSTEM
 -- ============================================================================
-local function GetWagonEntity(wagonNetId)
+local function GetLogWagon(wagonNetId)
+    if type(wagonNetId) ~= 'number' then return nil end
     local wagon = NetworkGetEntityFromNetworkId(wagonNetId)
-    if not wagon or wagon == 0 or not DoesEntityExist(wagon) then return nil end
+    if not wagon or wagon == 0 or not DoesEntityExist(wagon) or GetEntityModel(wagon) ~= Config.Wagon.Model then
+        return nil
+    end
     return wagon
+end
+
+local function IsPlayerNearEntity(src, entity, maxDist)
+    local c = GetPlayerCoords(src)
+    return c and #(c - GetEntityCoords(entity)) <= maxDist
+end
+
+-- The authoritative log count lives in WagonLoads (clients can write state bags
+-- on entities they own). The entity state bag only drives visuals, so every
+-- client - including players who stream in later - sees the right stack.
+local function SetWagonLogs(wagon, wagonNetId, count)
+    WagonLoads[wagonNetId] = count > 0 and count or nil
+    Entity(wagon).state:set('lumberjackLogs', count > 0 and count or nil, true)
 end
 
 RegisterNetEvent('rsg-lumberjack:server:addLogToWagon', function(wagonNetId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
+    if not CarryingPlayers[src] then return NotifyError(src, 'not_carrying') end
 
-    if not CarryingPlayers[src] then
-        NotifyError(src, 'not_carrying')
-        return
-    end
+    local wagon = GetLogWagon(wagonNetId)
+    if not wagon then return NotifyError(src, 'need_wagon') end
+    if not IsPlayerNearEntity(src, wagon, Config.Wagon.LoadDistance) then return NotifyError(src, 'not_nearby') end
 
-    local wagon = GetWagonEntity(wagonNetId)
-    if not wagon then
-        NotifyError(src, 'error_generic')
-        return
-    end
+    local count = WagonLoads[wagonNetId] or 0
+    if count >= Config.Wagon.MaxLogsOnWagon then return NotifyError(src, 'wagon_full') end
 
-    local pCoords = GetPlayerCoords(src)
-    if GetDistance(pCoords, GetEntityCoords(wagon)) > Config.Wagon.LoadDistance then
-        NotifyError(src, 'not_nearby')
-        return
-    end
-
-    if not WagonLoads[wagonNetId] then
-        WagonLoads[wagonNetId] = { logCount = 0, positions = {} }
-    end
-    local load = WagonLoads[wagonNetId]
-
-    if load.logCount >= Config.Wagon.MaxLogsOnWagon then
-        NotifyError(src, 'wagon_full')
-        return
-    end
-
-    local posIndex = load.logCount + 1
-    load.logCount = posIndex
-    table.insert(load.positions, posIndex)
-
-    CarryingPlayers[src] = nil
-    TriggerClientEvent('rsg-lumberjack:client:playerStoppedCarrying', -1, src)
-    TriggerClientEvent('rsg-lumberjack:client:logAddedToWagon', -1, wagonNetId, posIndex, src)
-
-    NotifySuccess(src, 'log_loaded', { load.logCount, Config.Wagon.MaxLogsOnWagon })
-    DebugPrint('Wagon', wagonNetId, 'log count now', load.logCount)
+    SetCarrying(src, false)
+    SetWagonLogs(wagon, wagonNetId, count + 1)
+    NotifySuccess(src, 'log_loaded', { count + 1, Config.Wagon.MaxLogsOnWagon })
 end)
 
 RegisterNetEvent('rsg-lumberjack:server:removeLogFromWagon', function(wagonNetId)
     local src = source
-    local Player = RSGCore.Functions.GetPlayer(src)
-    if not Player then return end
+    if not RSGCore.Functions.GetPlayer(src) then return end
+    if CarryingPlayers[src] then return NotifyError(src, 'already_carrying') end
 
-    if CarryingPlayers[src] then
-        NotifyError(src, 'already_carrying')
-        return
-    end
+    local count = WagonLoads[wagonNetId] or 0
+    if count <= 0 then return NotifyError(src, 'wagon_empty') end
 
-    local load = WagonLoads[wagonNetId]
-    if not load or load.logCount <= 0 then
-        NotifyError(src, 'not_nearby')
-        return
-    end
+    local wagon = GetLogWagon(wagonNetId)
+    if not wagon then return NotifyError(src, 'need_wagon') end
+    if not IsPlayerNearEntity(src, wagon, Config.Wagon.LoadDistance) then return NotifyError(src, 'not_nearby') end
 
-    local wagon = GetWagonEntity(wagonNetId)
-    if not wagon then
-        NotifyError(src, 'error_generic')
-        return
-    end
-
-    local pCoords = GetPlayerCoords(src)
-    if GetDistance(pCoords, GetEntityCoords(wagon)) > Config.Wagon.LoadDistance then
-        NotifyError(src, 'not_nearby')
-        return
-    end
-
-    local posIndex = table.remove(load.positions)
-    if not posIndex then
-        NotifyError(src, 'not_nearby')
-        return
-    end
-    load.logCount = load.logCount - 1
-
-    CarryingPlayers[src] = true
-    TriggerClientEvent('rsg-lumberjack:client:logRemovedFromWagon', -1, wagonNetId, posIndex, src)
-    TriggerClientEvent('rsg-lumberjack:client:playerStartedCarrying', -1, src)
-
+    SetWagonLogs(wagon, wagonNetId, count - 1)
+    SetCarrying(src, true)
     NotifySuccess(src, 'log_unloaded')
-    DebugPrint('Wagon', wagonNetId, 'log removed, count now', load.logCount)
 end)
 
-RegisterNetEvent('rsg-lumberjack:server:requestWagonSync', function(wagonNetId)
-    local src = source
-    local load = WagonLoads[wagonNetId]
-    TriggerClientEvent('rsg-lumberjack:client:syncWagonLogs', src, wagonNetId, load and load.positions or {})
-end)
-
-RSGCore.Functions.CreateCallback('rsg-lumberjack:server:getWagonLogs', function(source, cb, wagonNetId)
-    local load = WagonLoads[wagonNetId]
-    cb(load and { logCount = load.logCount, positions = load.positions } or { logCount = 0, positions = {} })
-end)
-
-RegisterNetEvent('rsg-lumberjack:server:sellWagonLoad', function(wagonNetId, locationIndex)
+RegisterNetEvent('rsg-lumberjack:server:sellWagonLoad', function()
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
     if not Player then return end
 
-    local wagon = GetWagonEntity(wagonNetId)
-    if not wagon or GetEntityModel(wagon) ~= Config.Wagon.Model then
-        NotifyError(src, 'need_wagon')
-        return
+    -- Wagon is resolved from the server-side ped, never from a client-sent id
+    local wagon = GetVehiclePedIsIn(GetPlayerPed(src), false)
+    if not wagon or wagon == 0 or GetEntityModel(wagon) ~= Config.Wagon.Model then
+        return NotifyError(src, 'need_wagon')
+    end
+    local wagonNetId = NetworkGetNetworkIdFromEntity(wagon)
+
+    local count = WagonLoads[wagonNetId] or 0
+    if count < Config.Wagon.MaxLogsOnWagon then
+        return NotifyError(src, 'wagon_not_full', { count, Config.Wagon.MaxLogsOnWagon })
     end
 
-    -- Player must actually be seated in the wagon they're claiming to sell
-    local ped = GetPlayerPed(src)
-    if GetVehiclePedIsIn(ped, false) ~= wagon then
-        NotifyError(src, 'need_wagon')
-        return
-    end
-
-    local load = WagonLoads[wagonNetId]
-    if not load or load.logCount < Config.Wagon.MaxLogsOnWagon then
-        NotifyError(src, 'wagon_not_full', { load and load.logCount or 0, Config.Wagon.MaxLogsOnWagon })
-        return
-    end
-
-    -- Never trust a client-supplied price - always resolve the price from a
-    -- server-side config entry whose radius actually contains the wagon.
     local wagonCoords = GetEntityCoords(wagon)
-    local location = nil
-    if type(locationIndex) == 'number' and Config.WagonSellLocations[locationIndex] then
-        local candidate = Config.WagonSellLocations[locationIndex]
-        if GetDistance(wagonCoords, candidate.coords) <= candidate.radius then
+    local location
+    for _, candidate in ipairs(Config.WagonSellLocations) do
+        if #(wagonCoords - candidate.coords) <= candidate.radius then
             location = candidate
+            break
         end
     end
-    if not location then
-        for _, candidate in ipairs(Config.WagonSellLocations) do
-            if GetDistance(wagonCoords, candidate.coords) <= candidate.radius then
-                location = candidate
-                break
+    if not location then return NotifyError(src, 'not_at_sell_location') end
+
+    SetWagonLogs(wagon, wagonNetId, 0) -- clear first so a double event can't pay twice
+    Player.Functions.AddMoney('cash', location.price, 'lumberjack-wagon-sale')
+    NotifySuccess(src, 'wagon_sold', { location.price })
+    DebugPrint('Player', src, 'sold wagon at', location.coords, 'for', location.price)
+end)
+
+-- ============================================================================
+-- CLEANUP (expired ground items, deleted wagons, dropped players)
+-- ============================================================================
+CreateThread(function()
+    local lifetime = Config.Items.GroundDespawnMinutes * 60
+    while true do
+        Wait(60 * 1000)
+        local now = os.time()
+        for id, log in pairs(GroundLogs) do
+            if now - log.createdAt >= lifetime then
+                GroundLogs[id] = nil
+                TriggerClientEvent('rsg-lumberjack:client:removeGroundLog', -1, id)
             end
         end
+        for id, wood in pairs(WoodPieces) do
+            if now - wood.createdAt >= lifetime then
+                WoodPieces[id] = nil
+                TriggerClientEvent('rsg-lumberjack:client:removeWoodPiece', -1, id)
+            end
+        end
+        for netId in pairs(WagonLoads) do
+            if not GetLogWagon(netId) then WagonLoads[netId] = nil end -- wagon deleted
+        end
     end
-
-    if not location then
-        NotifyError(src, 'not_at_sell_location')
-        return
-    end
-
-    Player.Functions.AddMoney('cash', location.price, 'lumber-wagon-sale')
-    WagonLoads[wagonNetId] = nil
-    TriggerClientEvent('rsg-lumberjack:client:resetWagon', -1, wagonNetId)
-
-    NotifySuccess(src, 'wagon_sold', { location.price })
-    DebugPrint('Player', src, 'sold wagon', wagonNetId, 'at', location.name, 'for', location.price)
 end)
 
--- ============================================================================
--- CLEANUP
--- ============================================================================
-AddEventHandler('playerDropped', function()
-    local src = source
-    if CarryingPlayers[src] then
-        CarryingPlayers[src] = nil
-        TriggerClientEvent('rsg-lumberjack:client:playerStoppedCarrying', -1, src)
-    end
+local function ClearPlayer(src)
+    CarryingPlayers[src] = nil
     PendingActions[src] = nil
     LastChopAt[src] = nil
+    PlantingPlayers[src] = nil
+    LastSyncAt[src] = nil
+end
+
+AddEventHandler('playerDropped', function()
+    ClearPlayer(source) -- player state bag is destroyed with the player
 end)
 
-AddEventHandler('onResourceStart', function(resource)
-    if resource ~= GetCurrentResourceName() then return end
-    Wait(500)
-    GroundLogs = {}
-    WoodPieces = {}
-    WagonLoads = {}
-    CarryingPlayers = {}
-    PendingActions = {}
-    LastChopAt = {}
-    nextLogId, nextWoodId = 1, 1
-    LoadPlantedTreesFromDB()
-    DebugPrint('rsg-lumberjack server started (ephemeral state reset, trees reloaded from DB)')
-end)
-
-AddEventHandler('onResourceStop', function(resource)
-    if resource ~= GetCurrentResourceName() then return end
-    GroundLogs = {}
-    WoodPieces = {}
-    WagonLoads = {}
-    CarryingPlayers = {}
-    PendingActions = {}
-    DebugPrint('rsg-lumberjack server stopped - state cleared')
+-- Character logout / switch: drop the carried log state so it can't follow the next character
+-- AddEventHandler (not RegisterNetEvent) so clients can't fire it for other players
+AddEventHandler('RSGCore:Server:OnPlayerUnload', function(src)
+    src = tonumber(src)
+    if not src then return end
+    if CarryingPlayers[src] then SetCarrying(src, false) end
+    ClearPlayer(src)
 end)

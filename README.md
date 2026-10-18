@@ -1,87 +1,95 @@
 # rsg-lumberjack
 
-A standalone lumberjack gameplay script for RSG-Core (RedM). No company/business
-ownership, no company database - it's just the core loop: grow trees, chop
-wood, carry logs, and load/unload/sell wagons at multiple locations. Tree
-growth persists across restarts (see Database section below).
+Lumberjack gameplay for RSG-Core (RedM): grow trees, chop them, carry logs,
+process them into wood, and sell full wagon loads of logs for cash.
 
 ## Dependencies
 - `rsg-core`
 - `ox_lib`
 - `ox_target`
 - `rsg-inventory`
-- `oxmysql` (or `mysql-async`/`ghmattimysql`) - used only to persist planted
-  tree growth. Ground logs, wood, and wagon loads remain in-memory only and
-  reset on resource restart.
+- `oxmysql`
 
-## Items needed for inventory
-Add these to your `items.lua` / shared items table:
+## Installation
+1. Drop `rsg-lumberjack` into your resources folder and add `ensure rsg-lumberjack`
+   to your server.cfg (after the dependencies).
+2. Add the `tree_seeds` item from `install/items.txt` to `rsg-core/shared/items.lua`
+   and copy `install/tree_seeds.png` into `rsg-inventory/html/images/`.
+3. The `rsg_lumberjack_trees` table is created automatically on first start.
+   `install/database.sql` is provided for manual installation.
 
-| Item | Type | Purpose |
-|------|------|---------|
-| `tree_seeds` | item | Plant a new tree |
-| `fullbucket` | item | Water a planted tree |
-| `log` | item (or prop-only) | Represents a chopped log while carried |
-| `wood` | item | Processed wood picked up after chopping a log |
-| `axe` | weapon/item | Required to chop trees and process logs |
+## Items used
+| Item | Config | Purpose |
+|------|--------|---------|
+| `tree_seeds` | `Config.Planting.SeedItem` | Use to plant a tree |
+| `fullbucket` | `Config.Planting.WaterItem` | Use near a tree (or target it) to water it |
+| `resource_wood` | `Config.Items.Wood` | Picked up from wood piles after processing a log |
+| `axe` | `Config.Chopping.AxeItem` | Required to chop trees and process logs |
+
+Logs themselves are not inventory items - they are carried physically.
 
 ## Gameplay loop
-1. **Growing** - use `tree_seeds` anywhere to plant a tree. Water it
-   (`fullbucket`) to advance it through its growth stages. Once fully grown
-   it can be chopped for a log. Tree props only spawn client-side while a
-   player is within `Config.Planting.RenderDistance` (perf-friendly), and
-   the owner sees a live progress bar above any of their own actively-growing
-   trees within `Config.Planting.ProgressBarDistance`.
-2. **Chopping** - chop wild trees found around the map, or chop your own
-   fully-grown planted trees, to get a log. Requires an axe
-   (`Config.Chopping.RequireAxe`), which has a chance to break
+1. **Planting** - use `tree_seeds` anywhere. Water the sapling (target it, or use
+   `fullbucket` next to it) to start each growth stage. The owner sees a growth bar
+   above their trees and gets a notification when a tree needs water again or is
+   ready to chop. Set `Config.Planting.RequireWater = false` for trees that grow
+   by themselves.
+2. **Chopping** - chop wild trees (`Config.Trees`) or your fully-grown planted
+   trees with an axe to get a log in your hands. The axe can break
    (`Config.Chopping.AxeBreakChance`).
-3. **Carrying** - chopping (or picking up a dropped log) attaches it to your
-   hands. Press E to drop it on the ground, where anyone can pick it up or
-   process it into wood (`Config.Items.WoodAmountFromLog` per log).
-4. **Wagon load/unload** - approach a log wagon (`Config.Wagon.Model`) while
-   carrying a log to load it on (up to `Config.Wagon.MaxLogsOnWagon`). You can
-   also pull a log back off into your hands.
-5. **Sell wagon load** - drive a full wagon to any location in
-   `Config.WagonSellLocations` and press E to sell the whole load for cash.
-   Each location has its own `price` and `radius`, so you can add as many
-   buyers as you want around the map.
+3. **Carrying** - press **E** to drop a carried log. Anyone can pick it up again
+   or process it into `Config.Items.WoodAmountFromLog` wood piles, each giving
+   one `resource_wood`. Ground items despawn after
+   `Config.Items.GroundDespawnMinutes`.
+4. **Wagon** - target a log wagon (`Config.Wagon.Model`) while carrying a log to
+   load it (up to `Config.Wagon.MaxLogsOnWagon`). Logs can be taken back off,
+   and "Check Wagon" shows the current load.
+5. **Selling** - drive a full wagon into any `Config.WagonSellLocations` zone and
+   press **E**. Each location has its own price, radius and blip.
 
 ## Configuration
-See `shared/config.lua`:
-- `Config.Chopping` - axe requirement/break chance, chop durations, cooldown.
-- `Config.Planting` - seed/water items, growth durations, max trees per
-  player, minimum distance between trees.
-- `Config.Wagon` - wagon model, log capacity, attachment/stacking positions.
-- `Config.WagonSellLocations` - array of `{ name, coords, radius, price, blip }`
-  sell points. Add or remove entries freely.
-- `Config.Trees` - the list of wild tree props that can be targeted/chopped.
+Everything lives in `shared/config.lua`:
+- `Config.Chopping` - axe, break chance, durations, cooldown, distances.
+- `Config.Planting` - items, durations, growth stages/models, max trees per
+  player, spacing, render distances.
+- `Config.Items` - wood item, wood per log, ground item lifetime.
+- `Config.Carry` - carry animation and log attach offsets.
+- `Config.Wagon` - wagon model, capacity, log stacking positions.
+- `Config.WagonSellLocations` - sell points (`name`, `coords`, `radius`, `price`, `blip`).
+- `Config.Trees` - wild tree models that can be chopped.
 
-## Database
-Planted tree growth is persisted in a `rsg_lumberjack_trees` table - the schema
-and growth-scheduling logic (`MaybeScheduleGrowth` / the periodic growth-tick
-loop) are identical to the original script's `lumbercompany_trees` table,
-just renamed since it's no longer tied to a company. The table is created
-automatically on resource start (`server/db.lua` + `server/main.lua`);
-`install/database.sql` is provided for reference/manual installation only.
+## Localisation
+All player-facing text (notifications, progress bars, target labels, prompts and
+blip names) lives in `locales/*.json`, loaded by ox_lib. Included languages:
+`en`, `de`, `el`, `es`, `fr`, `ja`, `nl`, `pl`, `pt-br`, `ro`.
 
-Ground logs, wood pieces, and wagon loads are still in-memory only and reset
-on resource restart - only tree growth needs to survive restarts.
+Set the language in your server.cfg with:
+```
+setr ox:locale de
+```
+To add a language, copy `locales/en.json` to `locales/<code>.json` and translate
+the values (keep the keys, `%s` placeholders and `~e~`/`~s~` colour codes).
+A sell point's blip name can be overridden per location with `blip.label`.
 
-## Notes
-- All notifications use `ox_lib` (`lib.notify` / `ox_lib:notify`).
-- All player-facing text lives in `locales/en.json`.
-- Chopping/carrying/wagon actions are validated server-side (axe ownership,
-  cooldowns, proximity, and elapsed time) before any reward is granted - the
-  client cannot unilaterally decide it "successfully chopped" something.
-- `server/versionchecker.lua` follows the standard Rexshack-RedM version
-  checker pattern. It checks
-  `https://raw.githubusercontent.com/Rexshack-RedM/rsg-versioncheckers/main/rsg-lumberjack/version.txt`
-  - update `githubRawBase` in that file if you host `rsg-lumberjack` update
-  checks somewhere else.
+## Security
+- All rewards (logs, wood, cash) are granted server-side only.
+- Chopping uses a request -> progress -> complete handshake with server-side
+  checks for axe ownership, cooldown, carry state, proximity and elapsed time,
+  re-validated on completion.
+- Drop positions, sell wagons and sell prices are resolved from the server-side
+  ped/config, never from client data. Planting positions are range-checked.
+- Wood piles and wagon loads are claimed before rewards are given, so duplicate
+  events can't dupe items or cash.
+- Wagon log counts are kept server-side; the wagon's state bag is only used to
+  draw the logs, so a client editing it can't change what gets sold.
+
+## Sync
+- Carried logs and wagon log stacks are driven by replicated state bags, so
+  players who join late or stream into range see them correctly.
+- Carry state is cleared on disconnect, character logout and resource restart.
 
 ## Debug
-Set `Config.Debug = true` to enable `/spawnlog`, `/clearlog`, and
-`/spawnwagon` test commands, plus verbose server/client console logging.
+`Config.Debug = true` enables console logging and `/spawnwagon`.
 
-Credit Mack
+## Credits
+Mack

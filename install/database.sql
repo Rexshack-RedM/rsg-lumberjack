@@ -2,12 +2,8 @@
 -- RSG-LUMBER - DATABASE SCHEMA
 -- =====================================================
 -- This table is created automatically on resource start
--- (see server/db.lua + server/main.lua). This file is
--- provided for reference / manual installation only.
---
--- Schema is identical to the original script's
--- `lumbercompany_trees` table, just renamed since planted
--- trees are no longer tied to a company.
+-- (server/main.lua). This file is provided for reference /
+-- manual installation only.
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS `rsg_lumberjack_trees` (
@@ -26,7 +22,5 @@ CREATE TABLE IF NOT EXISTS `rsg_lumberjack_trees` (
     `planted_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `next_stage_at` DATETIME NULL,
     PRIMARY KEY (`id`),
-    INDEX `idx_stage` (`stage`),
-    INDEX `idx_state` (`state`),
     INDEX `idx_owner` (`owner_citizenid`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

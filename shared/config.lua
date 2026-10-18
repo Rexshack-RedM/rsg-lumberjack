@@ -13,8 +13,9 @@ Config.Chopping = {
     TreeChopDuration = 7000,    -- ms
     LogChopDuration = 5000,     -- ms
     ChopCooldownMs = 10000,     -- ms, per-player cooldown after a completed chop
-    InteractDistance = 1.5,
-    RaycastDistance = 3.0,
+    InteractDistance = 1.5,     -- ox_target distance for trees
+    ServerDistance = 4.0,       -- server-side max distance between player and a log/tree/wood pile
+    RaycastDistance = 3.0,      -- how far in front of the player a seed is planted
     ActionTimeoutMs = 20000,    -- ms, how long a server-authorised chop stays valid before it expires
 }
 
@@ -24,15 +25,18 @@ Config.Chopping = {
 Config.Planting = {
     SeedItem = 'tree_seeds',
     WaterItem = 'fullbucket',
-    RequireWater = true,
+    RequireWater = true,         -- false = trees grow through every stage without watering
     MaxTreesPerPlayer = 10,
     MinPlantDistance = 3.0,
+    PlantDuration = 5000,        -- ms
+    WaterDuration = 8000,        -- ms
     RenderDistance = 40.0,       -- tree props only spawn client-side within this distance (perf)
     ProgressBarDistance = 12.0,  -- owner sees the growth progress bar within this distance
-    GrowthDurations = {
-        60, -- Stage 1 -> 2 (1 minute)
-        60, -- Stage 2 -> 3 (1 minute)
-        60  -- Stage 3 -> 4 (1 minute)
+    GrowthTickSeconds = 10,      -- how often the server checks for trees that finished a stage
+    GrowthDurations = {          -- seconds per stage
+        60, -- Stage 1 -> 2
+        60, -- Stage 2 -> 3
+        60  -- Stage 3 -> 4 (ready to chop)
     },
     StageModels = {
         'p_tree_birch_01_sapling',
@@ -46,35 +50,29 @@ Config.Planting = {
 -- LOG & WOOD SETTINGS
 -- ============================================================================
 Config.Items = {
-    Log = 'log',
-    Wood = 'wood',
-    WoodAmountFromLog = 4,
-    SpawnRadius = 5.0
+    Wood = 'resource_wood',      -- item given when picking up processed wood
+    WoodAmountFromLog = 4,       -- wood piles spawned per processed log (1 item each)
+    SpawnRadius = 3.0,           -- scatter radius of wood piles around the log
+    GroundDespawnMinutes = 30,   -- dropped logs / wood piles left on the ground are removed after this
 }
 
 Config.Models = {
-    Log = `p_cedar_log_06x`,
+    GroundLog = `p_cedar_log_06x`,
     WoodProp = `p_cs_woodpile01x`,
     CarryLog = `p_cedar_log_06x`
 }
 
 -- Carry settings
 Config.Carry = {
-    Mode = 'anim',
-    Style = 'box',
     AnimDict = 'amb_wander@code_human_hay_bale_wander@male_a@base',
     AnimClip = 'base',
     AnimFlag = 25,
-    MoveClipset = '',
+    MoveClipset = '',            -- optional movement clipset while carrying ('' = none)
     AttachBox = {
         bone = 7966,
         pos = { x = 0.0, y = 0.30, z = -0.10 },
         rot = { x = 0.0, y = 0.0, z = -90.0 }
     },
-    CarryScenario = {
-        enabled = false,
-        name = 'WORLD_HUMAN_CARRY_CRATE'
-    }
 }
 
 -- ============================================================================
@@ -84,7 +82,7 @@ Config.Wagon = {
     Model = `LOGWAGON`,
     MaxLogsOnWagon = 5,
     LogStackModel = `p_cedar_log_06x`,
-    LoadDistance = 3.0, -- server-side max distance from wagon to load/unload a log
+    LoadDistance = 4.0, -- server-side max distance from wagon to load/unload a log
     LogPositions = {
         -- Base layer (3 logs)
         { x = -0.4, y = -0.8, z = 0.25, rotX = 0, rotY = 0, rotZ = 90 },
@@ -94,48 +92,37 @@ Config.Wagon = {
         { x = -0.2, y = -0.8, z = 0.65, rotX = 0, rotY = 0, rotZ = 90 },
         { x = 0.2, y = -0.8, z = 0.65, rotX = 0, rotY = 0, rotZ = 90 },
     },
-    Attach = {
-        x = 0.0,
-        y = -1.0,
-        z = 0.1,
-        rotX = 0.90,
-        rotY = 0.0,
-        rotZ = 90.0
-    }
 }
 
 -- ============================================================================
 -- WAGON SELL LOCATIONS (sell a full wagon load of logs for cash)
 -- Add as many locations as you like - each has its own price.
+-- Fields: coords, radius, price, blip = { sprite, scale, label (optional) } or blip = false
 -- ============================================================================
 Config.WagonSellLocations = {
     {
-        name = 'Sell Logs',
         coords = vector3(-1808.22, -596.15, 154.95),
         radius = 5.0,
         price = 100,
-        blip = { sprite = 1904459580, scale = 0.2, label = 'Sell Logs' }
+        blip = { sprite = 1904459580, scale = 0.2 } -- label: optional override, defaults to locale 'blip_sell_logs'
     },
     {
-        name = 'Sell Logs',
         coords = vector3(-1395.34, -223.84, 100.86),
         radius = 5.0,
         price = 100,
-        blip = { sprite = 1904459580, scale = 0.2, label = 'Sell Logs' }
-    },    
-	{
-        name = 'Sell Logs',
+        blip = { sprite = 1904459580, scale = 0.2 } -- label: optional override, defaults to locale 'blip_sell_logs'
+    },
+    {
         coords = vector3(1053.37, -1125.14, 67.89),
         radius = 5.0,
         price = 100,
-        blip = { sprite = 1904459580, scale = 0.2, label = 'Sell Logs' }
+        blip = { sprite = 1904459580, scale = 0.2 } -- label: optional override, defaults to locale 'blip_sell_logs'
     },
-		{
-        name = 'Sell Logs',
+    {
         coords = vector3(2870.63, 1468.58, 68.03),
         radius = 5.0,
         price = 100,
-        blip = { sprite = 1904459580, scale = 0.2, label = 'Sell Logs' }
+        blip = { sprite = 1904459580, scale = 0.2 } -- label: optional override, defaults to locale 'blip_sell_logs'
     },
 }
 
@@ -143,8 +130,6 @@ Config.WagonSellLocations = {
 -- TARGET MODELS (Wild trees that can be chopped)
 -- ============================================================================
 Config.Trees = {
-	`p_tree_birch_03_md`,
-
     -- POPLAR & WILLOW
     `p_tree_poplar_01`, `p_tree_poplar_02`, `p_tree_riv_poplar_01`, `p_tree_riv_poplar_02`,
     `p_tree_willow_01`, `p_tree_willow_02`,
