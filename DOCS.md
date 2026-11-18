@@ -1,6 +1,6 @@
 # rsg-lumberjack — Developer Docs
 
-Version 3.2.0. No ox_lib dependency — uses rsg-core and rsg-target only.
+Version 3.3.0. No ox_lib dependency — uses rsg-core and rsg-target only.
 
 ## Dependencies
 `rsg-core`, `rsg-target`, `rsg-inventory`, `oxmysql`.
@@ -42,4 +42,10 @@ Version 3.2.0. No ox_lib dependency — uses rsg-core and rsg-target only.
 See `shared/config.lua`: `Chopping`, `Planting`, `Items`, `Models`, `Carry`, `Wagon`, `WagonSellLocations`, `Trees`.
 
 ## Changelog
+- **3.3.0** — Optional rsg-skills integration (`Config.Skills`): lumberjack XP and `extra_yield` perk on wood pickup.
 - **3.2.0** — Migrated off ox_lib to rsg-core (locale, notify, progress bar, anim loading, text UI); ox_target → rsg-target. Progress `disable.car` → `disable.mount`.
+
+## rsg-skills integration
+
+`Config.Skills = { Enabled, Skill, WoodXP, ExtraYield }`. In `rsg-lumberjack:server:pickupWood`, after the piece is claimed and added, the server calls `AddXP(src, 'lumberjack', WoodXP, ...)`. When `ExtraYield` is on, it rolls `math.random(100) <= GetPerk(src, 'lumberjack', 'extra_yield')` and adds one more piece when `CanAddItem` allows it. Everything runs on the server; skipped when rsg-skills is not started.
+

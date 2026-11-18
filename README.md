@@ -92,3 +92,8 @@ A sell point's blip name can be overridden per location with `blip.label`.
 
 ## Credits
 Mack
+
+## rsg-skills integration
+
+Optional. With `rsg-skills` started, picking up a wood piece awards lumberjack XP (`Config.Skills.WoodXP`) and the lumberjack `extra_yield` perk gives that percent chance of one extra piece. Set `Config.Skills.Enabled = false` (or `ExtraYield = false`) to turn it off.
+

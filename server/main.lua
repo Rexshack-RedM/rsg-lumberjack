@@ -376,6 +376,18 @@ RegisterNetEvent('rsg-lumberjack:server:pickupLog', function(logId)
     NotifySuccess(src, 'log_picked_up')
 end)
 
+-- rsg-skills (optional): award XP and read perks, both on the server
+local function skillXP(src, amount, reason)
+    if not Config.Skills.Enabled or not amount or amount <= 0 then return end
+    if GetResourceState('rsg-skills') ~= 'started' then return end
+    exports['rsg-skills']:AddXP(src, Config.Skills.Skill, amount, reason)
+end
+
+local function skillPerk(src, perk)
+    if not Config.Skills.Enabled or GetResourceState('rsg-skills') ~= 'started' then return 0 end
+    return tonumber(exports['rsg-skills']:GetPerk(src, Config.Skills.Skill, perk)) or 0
+end
+
 RegisterNetEvent('rsg-lumberjack:server:pickupWood', function(woodId)
     local src = source
     if not RSGCore.Functions.GetPlayer(src) then return end
@@ -392,6 +404,14 @@ RegisterNetEvent('rsg-lumberjack:server:pickupWood', function(woodId)
 
     exports['rsg-inventory']:AddItem(src, item, 1, nil, nil, 'lumberjack-wood-pickup')
     TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'add', 1)
+
+    -- rsg-skills: XP and the extra_yield perk (chance of one more piece)
+    skillXP(src, Config.Skills.WoodXP, 'lumberjack wood pickup')
+    if Config.Skills.ExtraYield and math.random(100) <= skillPerk(src, 'extra_yield')
+        and exports['rsg-inventory']:CanAddItem(src, item, 1) then
+        exports['rsg-inventory']:AddItem(src, item, 1, nil, nil, 'lumberjack-skill-bonus')
+        TriggerClientEvent('rsg-inventory:client:ItemBox', src, RSGCore.Shared.Items[item], 'add', 1)
+    end
 end)
 
 -- ============================================================================
